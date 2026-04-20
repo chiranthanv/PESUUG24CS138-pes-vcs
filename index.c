@@ -16,6 +16,7 @@
 // TODO functions:     index_load, index_save, index_add
 
 #include "index.h"
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,10 +136,38 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    index->count = 0;
+
+    FILE *fp = fopen(".pes/index", "r");
+    if (!fp) {
+        // File doesn't exist → empty index
+        return 0;
+    }
+
+    char hash_hex[HASH_HEX_SIZE + 1];
+
+    while (index->count < MAX_INDEX_ENTRIES) {
+        IndexEntry *e = &index->entries[index->count];
+
+        int ret = fscanf(fp, "%o %64s %lu %u %511[^\n]\n",
+                         &e->mode,
+                         hash_hex,
+                         &e->mtime_sec,
+                         &e->size,
+                         e->path);
+
+        if (ret != 5) break;
+
+        if (hex_to_hash(hash_hex, &e->hash) != 0) {
+            fclose(fp);
+            return -1;
+        }
+
+        index->count++;
+    }
+
+    fclose(fp);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
@@ -151,13 +180,73 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
-int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+static int compare_index_entries(const void *a, const void *b) {
+    return strcmp(((const IndexEntry *)a)->path,
+                  ((const IndexEntry *)b)->path);
 }
+int index_save(const Index *index) {
+    if (!index) return -1;
 
+    // Create temp file
+    char tmp_path[] = ".pes/index.tmpXXXXXX";
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) return -1;
+
+    // Allocate sorted copy on heap (FIXES STACK OVERFLOW)
+    Index *sorted = malloc(sizeof(Index));
+    if (!sorted) {
+        close(fd);
+        unlink(tmp_path);
+        return -1;
+    }
+    *sorted = *index;
+
+    // Sort entries
+    qsort(sorted->entries, sorted->count,
+          sizeof(IndexEntry), compare_index_entries);
+
+    char buffer[1024];
+    char hash_hex[HASH_HEX_SIZE + 1];
+
+    for (int i = 0; i < sorted->count; i++) {
+        hash_to_hex(&sorted->entries[i].hash, hash_hex);
+
+        int len = snprintf(buffer, sizeof(buffer),
+                           "%o %s %lu %u %s\n",
+                           sorted->entries[i].mode,
+                           hash_hex,
+                           sorted->entries[i].mtime_sec,
+                           sorted->entries[i].size,
+                           sorted->entries[i].path);
+
+        if (len < 0 || write(fd, buffer, len) != len) {
+            free(sorted);
+            close(fd);
+            unlink(tmp_path);
+            return -1;
+        }
+    }
+
+    // Ensure data is written to disk
+    if (fsync(fd) != 0) {
+        free(sorted);
+        close(fd);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    close(fd);
+
+    // Atomic rename
+    if (rename(tmp_path, ".pes/index") != 0) {
+        free(sorted);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    free(sorted);
+    return 0;
+}
 // Stage a file for the next commit.
 //
 // HINTS - Useful functions and syscalls:
@@ -168,8 +257,74 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    // Open file
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    // Get file size
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    long size = ftell(fp);
+    if (size < 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    rewind(fp);
+
+    // Allocate buffer (safe even if size == 0)
+    void *data = malloc(size > 0 ? size : 1);
+    if (!data) {
+        fclose(fp);
+        return -1;
+    }
+
+    // Read file content
+    if (size > 0 && fread(data, 1, size, fp) != (size_t)size) {
+        fclose(fp);
+        free(data);
+        return -1;
+    }
+
+    fclose(fp);
+
+    // Write blob to object store
+    ObjectID id;
+    if (object_write(OBJ_BLOB, data, size, &id) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+
+    // Get file metadata
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+
+    // Find or create index entry
+    IndexEntry *e = index_find(index, path);
+    if (!e) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
+        e = &index->entries[index->count++];
+    }
+
+    // FIXED: correct mode handling
+    if (st.st_mode & S_IXUSR)
+        e->mode = 0100755;
+    else
+        e->mode = 0100644;
+
+    e->hash = id;
+    e->mtime_sec = st.st_mtime;
+    e->size = st.st_size;
+
+    // FIXED: safe string copy
+    strncpy(e->path, path, sizeof(e->path) - 1);
+    e->path[sizeof(e->path) - 1] = '\0';
+
+    // Save index
+    return index_save(index);
 }
